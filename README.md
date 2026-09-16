@@ -78,16 +78,43 @@ pip install torch-scatter==2.1.2 torch-sparse==0.6.18 torch-geometric==2.4.0 -f 
 pip install ninja easydict pyyaml
 ```
 
-<details>
-<summary> Compilation of the `rspmm` kernel </summary>
+<details open>
+<summary><b>Important: Troubleshooting `rspmm` CUDA Kernel Compilation</b></summary>
 
-To make relational message passing iteration `O(V)` instead of `O(E)` we ship a custom `rspmm` kernel that will be compiled automatically upon the first launch. The `rspmm` kernel supports `transe` and `distmult` message functions, others like `rotate` will resort to full edge materialization and `O(E)` complexity.
+To make relational message passing iteration `O(V)` instead of `O(E)` ULTRA ships a custom `rspmm` (*Relational Sparse Matrix Multiplication*) kernel (`ultra/rspmm/source/rspmm.cu` and `rspmm.cpp`) that is compiled on-the-fly via PyTorch's C++ extension system (`torch.utils.cpp_extension`) on the first run, and then cached.
 
-The kernel can be compiled on both CPUs (including M1/M2 on Macs) and GPUs (it is done only once and then cached). For GPUs, you need a CUDA 11.8+ toolkit with the `nvcc` compiler. If you are deploying this in a Docker container, make sure to start from the `devel` images that contain `nvcc` in addition to plain CUDA runtime.
+#### Common Issues & How to Remedy Them:
 
-Make sure your `CUDA_HOME` variable is set properly to avoid potential compilation errors, eg
+1. **`RuntimeError: Ninja is required to load C++ extensions`**
+   * **Cause:** `ninja` build tool is not installed or not discoverable on `PATH`.
+   * **Remedy:** Install `ninja` inside your conda/pip environment:
+     ```bash
+     pip install ninja
+     # or: conda install -c conda-forge ninja
+     ```
+
+2. **`OSError: CUDA_HOME environment variable is not set` or `/bin/nvcc: not found`**
+   * **Cause:** PyTorch cannot find the CUDA compiler (`nvcc`) toolchain.
+   * **Remedy:** In a Conda environment with CUDA packages, point `CUDA_HOME` to your active conda environment:
+     ```bash
+     export CUDA_HOME=$CONDA_PREFIX
+     ```
+     To persist this automatically whenever the environment is activated:
+     ```bash
+     conda env config vars set CUDA_HOME=$CONDA_PREFIX
+     ```
+
+3. **`fatal error: cusparse.h: No such file or directory` (or missing `cublas_v2.h` / `cusolverDn.h`)**
+   * **Cause:** PyTorch's ATen CUDA headers require the CUDA development libraries (`cusparse`, `cublas`, `cusolver`), which are not included in bare runtime installs.
+   * **Remedy:** Install the matching CUDA 11.8 compiler and development packages:
+     ```bash
+     conda install -c nvidia cuda-nvcc=11.8.89 cuda-libraries-dev=11.8.0 cuda-cccl=11.8.89 -y
+     ```
+
+Once installed, verify compilation directly in Python:
 ```bash
-export CUDA_HOME=/usr/local/cuda-11.8/
+export CUDA_HOME=$CONDA_PREFIX
+python -c "import ultra.rspmm; print('rspmm compiled and loaded successfully!')"
 ```
 
 </details>
@@ -177,7 +204,11 @@ python script/run.py -c config/inductive/inference.yaml --dataset FB15k237Induct
 
 An example command for a transductive dataset to run on a GPU:
 ```bash
-python script/run.py -c config/transductive/inference.yaml --dataset CoDExSmall --epochs 0 --bpe null --gpus [0] --ckpt /path/to/ultra/ckpts/ultra_4g.pth
+# Ensure CUDA_HOME is set in your environment
+export CUDA_HOME=$CONDA_PREFIX
+
+# Run zero-shot inference on CoDExSmall using the pre-trained ultra_4g checkpoint
+python script/run.py -c config/transductive/inference.yaml --dataset CoDExSmall --epochs 0 --bpe null --gpus [0] --ckpt ckpts/ultra_4g.pth
 ```
 
 ### Run on many datasets
@@ -440,19 +471,19 @@ Due to the size of the datasets and query complexity, it is recommended to run i
 An example command for running transductive inference with UltraQuery on FB15k237 queries
 
 ```bash
-python script/run_query.py -c config/ultraquery/transductive.yaml --dataset FB15k237LogicalQuery --epochs 0 --bpe null --gpus [0] --bs 32 --threshold 0.0 --ultra_ckpt null --qe_ckpt /path/to/ultra/ckpts/ultraquery.pth
+python script/run_query.py -c config/ultraquery/transductive.yaml --dataset FB15k237LogicalQuery --epochs 0 --bpe null --gpus [0] --bs 32 --threshold 0.0 --ultra_ckpt null --qe_ckpt ckpts/ultraquery.pth
 ```
 
 An example command for running transductive inference with a vanilla Ultra 4g on FB15k237 queries with scores thresholding
 
 ```bash
-python script/run_query.py -c config/ultraquery/transductive.yaml --dataset FB15k237LogicalQuery --epochs 0 --bpe null --gpus [0] --bs 32 --threshold 0.8 --ultra_ckpt /path/to/ultra/ckpts/ultra_4g.pth --qe_ckpt null
+python script/run_query.py -c config/ultraquery/transductive.yaml --dataset FB15k237LogicalQuery --epochs 0 --bpe null --gpus [0] --bs 32 --threshold 0.8 --ultra_ckpt ckpts/ultra_4g.pth --qe_ckpt null
 ```
 
 An example command for running inductive inference with UltraQuery on `InductiveFB15k237Query:550` queries
 
 ```bash
-python script/run_query.py -c config/ultraquery/inductive.yaml --dataset InductiveFB15k237Query --version 550 --epochs 0 --bpe null --gpus [0] --bs 32 --threshold 0.0 --ultra_ckpt null --qe_ckpt /path/to/ultra/ckpts/ultraquery.pth
+python script/run_query.py -c config/ultraquery/inductive.yaml --dataset InductiveFB15k237Query --version 550 --epochs 0 --bpe null --gpus [0] --bs 32 --threshold 0.0 --ultra_ckpt null --qe_ckpt ckpts/ultraquery.pth
 ```
 
 New arguments for `_query` scripts:
@@ -501,6 +532,66 @@ The queries were sampled from the WikiTopics splits proposed in [Double Equivari
 ### Metrics
 
 New metrics include `auroc`, `spearmanr`, `mape`. We don't support Mean Rank `mr` in complex queries. If you ever see `nan` in one of those metrics, consider reducing the batch size as those metrics are computed with the variadic functions that might be numerically unstable on large batches.
+
+## DataFrame Interoperability & Jupyter Exploration (`ultra.export_utils`) ##
+
+To easily inspect, manipulate, and explore ULTRA knowledge graph datasets inside **Jupyter Notebooks**, `ultra.export_utils` provides seamless conversion between **pandas DataFrames** and ULTRA's PyTorch Geometric `Data` structures (including the custom 4-type relation graph).
+
+### 1. Exporting ULTRA Graphs to Pandas DataFrames
+Convert PyG graphs or full pre-packaged datasets (`dataset[0]`, `train_data`, etc.) directly into DataFrames:
+
+```python
+import pandas as pd
+from ultra.datasets import CoDExSmall
+from ultra.export_utils import graph_to_dataframe, relation_graph_to_dataframe, dataset_to_dataframes, graph_summary
+
+# Load a dataset
+dataset = CoDExSmall(root="~/git/ULTRA/kg-datasets/")
+
+# Quick summary of nodes, edges, relations, and relation graph
+print(graph_summary(dataset[0]))
+
+# Convert an entire dataset into {'train': df, 'valid': df, 'test': df}
+dfs = dataset_to_dataframes(dataset)
+train_df = dfs["train"]
+# Columns: ['head', 'relation', 'tail', 'head_id', 'relation_id', 'tail_id']
+print(train_df.head())
+
+# Export the 4-fundamental-interaction relation graph (head-to-head, tail-to-tail, etc.)
+rel_df = relation_graph_to_dataframe(dataset[0].relation_graph)
+print(rel_df.head())
+```
+
+### 2. Importing Pandas DataFrames into ULTRA Graphs
+Load custom tabular data / CSVs directly into ULTRA-ready PyG `Data` objects:
+
+```python
+import pandas as pd
+from ultra.export_utils import dataframe_to_graph, dataframes_to_dataset
+
+# Custom triples dataframe
+df = pd.DataFrame([
+    {"head": "Alice", "relation": "friends_with", "tail": "Bob"},
+    {"head": "Bob", "relation": "lives_in", "tail": "Wonderland"},
+    {"head": "Alice", "relation": "born_in", "tail": "Wonderland"},
+])
+
+# Converts to PyG Data, adds inverse edges (num_relations * 2), and builds graph.relation_graph
+graph, entity_vocab, rel_vocab = dataframe_to_graph(
+    df, 
+    head_col="head", 
+    rel_col="relation", 
+    tail_col="tail", 
+    add_inverse_edges=True, 
+    build_rel_graph=True
+)
+
+# Or construct shared train/valid/test transductive splits directly:
+splits = dataframes_to_dataset(train_df=df, valid_df=val_df, test_df=test_df)
+train_data = splits["train_data"]
+valid_data = splits["valid_data"]
+test_data  = splits["test_data"]
+```
 
 ## Citation ##
 
