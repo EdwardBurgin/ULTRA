@@ -597,6 +597,41 @@ test_data  = splits["test_data"]
 
 In addition to offline dataset benchmarking, ULTRA provides an interactive inference pipeline `UltraQueryPipeline` to answer single first-order logical (FOL) queries on any graph (transductive or inductive). The pipeline evaluates multi-hop projections (`1p`, `2p`, `3p`), conjunctions/intersections (`2i`, `3i`), negations (`2in`), and disjunctions/unions (`2u`), returning ranked candidate entities with confidence scores in a **pandas DataFrame**.
 
+### Natural Language Question Answering
+
+You can ask naturally phrased English questions directly to the pipeline without manually writing BetaE tuples:
+
+```python
+from ultra.pipeline import UltraQueryPipeline
+
+pipeline = UltraQueryPipeline.from_pretrained(
+    dataset="FB15k237LogicalQuery",
+    ckpt_path="ckpts/ultraquery.pth",
+    device="cuda:0",
+)
+
+# 1-hop path query:
+df1 = pipeline.ask_natural("What films did Christopher Nolan direct?", top_k=5)
+
+# 1-hop birthplace query:
+df2 = pipeline.ask_natural("Where was Christopher Nolan born?", top_k=3)
+
+# 2-hop intersection (conjunction):
+df3 = pipeline.ask_natural("Which movies star Christian Bale and were directed by Christopher Nolan?", top_k=5)
+
+# 2-hop intersection with negation:
+df4 = pipeline.ask_natural("Which movies star Christian Bale and were not directed by Christopher Nolan?", top_k=5)
+
+# 2-hop chained path query:
+df5 = pipeline.ask_natural("Where was the director of Inception born?", top_k=3)
+```
+
+Run from the command line:
+```bash
+python script/query_one.py -d FB15k237LogicalQuery -n "What films did Christopher Nolan direct?" -k 5
+python script/query_one.py -d FB15k237LogicalQuery -n "Which movies star Christian Bale and were directed by Christopher Nolan?" -k 5
+```
+
 ### 1. Python / Jupyter Notebook API
 
 ```python

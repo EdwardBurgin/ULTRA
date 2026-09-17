@@ -1,5 +1,6 @@
 import os
 import pickle
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -7,6 +8,7 @@ import torch
 from torch_geometric.data import Data
 
 from ultra.models import Ultra
+from ultra.nl_parser import NLQueryParser
 from ultra.query_utils import Query
 from ultra.tasks import build_relation_graph
 from ultra.ultraquery import UltraQuery
@@ -14,9 +16,10 @@ from ultra.ultraquery import UltraQuery
 
 class UltraQueryPipeline:
     """
-    High-level pipeline for asking single complex logical queries against knowledge graphs.
+    High-level pipeline for asking complex logical and natural language queries against knowledge graphs.
     
     Supports:
+      - Natural language questions via .ask_natural("What films did Christopher Nolan direct?")
       - 1-hop projection (1p): (e, (r,))
       - 2-hop projection (2p): (e, (r1, r2))
       - 3-hop projection (3p): (e, (r1, r2, r3))
@@ -35,6 +38,8 @@ class UltraQueryPipeline:
         id2rel: Optional[Dict[int, str]] = None,
         ent2id: Optional[Dict[str, int]] = None,
         rel2id: Optional[Dict[str, int]] = None,
+        ent2text: Optional[Dict[str, str]] = None,
+        rel2text: Optional[Dict[str, str]] = None,
         device: Optional[torch.device] = None,
         dataset_name: Optional[str] = None,
         easy_answers: Optional[Dict[Tuple, Any]] = None,
@@ -53,6 +58,15 @@ class UltraQueryPipeline:
         self.id2rel = id2rel or {}
         self.ent2id = ent2id or {v: k for k, v in self.id2ent.items()}
         self.rel2id = rel2id or {v: k for k, v in self.id2rel.items()}
+        
+        self.ent2text = ent2text or {}
+        self.rel2text = rel2text or {}
+
+        # Human-readable entity names
+        self.id2name = {eid: self.ent2text.get(mid, mid) for eid, mid in self.id2ent.items()}
+
+        # Natural Language Parser
+        self.nl_parser = NLQueryParser(self.id2ent, self.id2rel, self.ent2text, self.rel2text)
 
         self.dataset_name = dataset_name or "CustomGraph"
         self.easy_answers = easy_answers or {}
@@ -87,6 +101,8 @@ class UltraQueryPipeline:
 
         id2ent = {}
         id2rel = {}
+        ent2text = {}
+        rel2text = {}
         easy_answers = {}
         hard_answers = {}
         dataset_name = dataset if isinstance(dataset, str) else getattr(dataset, "name", "custom")
@@ -134,6 +150,37 @@ class UltraQueryPipeline:
                 with open(os.path.join(path, "id2rel.pkl"), "rb") as f:
                     id2rel = pickle.load(f)
 
+                # Check / download human-readable entity and relation names for FB15k-237
+                ent2text_file = os.path.join(path, "entity2text.txt")
+                rel2text_file = os.path.join(path, "relation2text.txt")
+                if "237" in dir_name:
+                    if not os.path.exists(ent2text_file):
+                        try:
+                            url = "https://raw.githubusercontent.com/yao8839836/kg-bert/master/data/FB15k-237/entity2text.txt"
+                            urllib.request.urlretrieve(url, ent2text_file)
+                        except Exception:
+                            pass
+                    if not os.path.exists(rel2text_file):
+                        try:
+                            url = "https://raw.githubusercontent.com/yao8839836/kg-bert/master/data/FB15k-237/relation2text.txt"
+                            urllib.request.urlretrieve(url, rel2text_file)
+                        except Exception:
+                            pass
+
+                if os.path.exists(ent2text_file):
+                    with open(ent2text_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            parts = line.strip().split("\t")
+                            if len(parts) >= 2:
+                                ent2text[parts[0].strip()] = parts[1].strip()
+
+                if os.path.exists(rel2text_file):
+                    with open(rel2text_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            parts = line.strip().split("\t")
+                            if len(parts) >= 2:
+                                rel2text[parts[0].strip()] = parts[1].strip()
+
                 triplets = []
                 triplet_file = os.path.join(path, "train.txt")
                 with open(triplet_file) as f:
@@ -151,9 +198,9 @@ class UltraQueryPipeline:
                     inverse_rel_plus_one=True,
                 )
 
-                # Load easy/hard test answers if available
-                easy_path = os.path.join(path, f"{split}-easy-answers.pkl")
-                hard_path = os.path.join(path, f"{split}-hard-answers.pkl")
+                # Optionally load test answers for ground-truth checks
+                easy_path = os.path.join(path, "test-easy-answers.pkl")
+                hard_path = os.path.join(path, "test-hard-answers.pkl")
                 if os.path.exists(easy_path):
                     with open(easy_path, "rb") as f:
                         easy_answers = pickle.load(f)
@@ -161,113 +208,106 @@ class UltraQueryPipeline:
                     with open(hard_path, "rb") as f:
                         hard_answers = pickle.load(f)
 
-        elif hasattr(dataset, "train_graph") or hasattr(dataset, "test_graph"):
-            # Existing dataset instance
-            if split == "train":
-                graph = dataset.train_graph
-            elif split == "valid":
-                graph = dataset.valid_graph
-            else:
-                graph = dataset.test_graph
-            id2ent = getattr(dataset, "inv_entity_vocab", {})
-            id2rel = getattr(dataset, "inv_relation_vocab", {})
-            dataset_name = str(dataset)
-        elif isinstance(dataset, Data):
+        elif hasattr(dataset, "edge_index"):
             graph = dataset
+            id2ent = getattr(dataset, "inv_entity_vocab", {i: str(i) for i in range(graph.num_nodes)})
+            id2rel = getattr(dataset, "inv_relation_vocab", {i: str(i) for i in range(graph.num_relations)})
         else:
             raise ValueError(f"Unsupported dataset format: {type(dataset)}")
 
-        # 2. Build model
+        # 2. Build model architecture
+        base_model = Ultra(
+            rel_model_cfg={
+                "class": "RelNBFNet",
+                "input_dim": 64,
+                "hidden_dims": [64] * 6,
+                "message_func": "distmult",
+                "aggregate_func": "sum",
+                "short_cut": True,
+                "layer_norm": True,
+            },
+            entity_model_cfg={
+                "class": "QueryNBFNet",
+                "input_dim": 64,
+                "hidden_dims": [64] * 6,
+                "message_func": "distmult",
+                "aggregate_func": "sum",
+                "short_cut": True,
+                "layer_norm": True,
+            },
+        )
+
         model = UltraQuery(
-            model=Ultra(
-                rel_model_cfg={
-                    "class": "RelNBFNet",
-                    "input_dim": 64,
-                    "hidden_dims": [64] * 6,
-                    "message_func": "distmult",
-                    "aggregate_func": "sum",
-                    "short_cut": True,
-                    "layer_norm": True,
-                },
-                entity_model_cfg={
-                    "class": "QueryNBFNet",
-                    "input_dim": 64,
-                    "hidden_dims": [64] * 6,
-                    "message_func": "distmult",
-                    "aggregate_func": "sum",
-                    "short_cut": True,
-                    "layer_norm": True,
-                },
-            ),
+            model=base_model,
             logic="product",
             threshold=threshold,
         )
 
-        if not os.path.exists(ckpt_path):
-            # Try prepending repo root if relative
-            cand = os.path.join(os.path.dirname(os.path.dirname(__file__)), ckpt_path)
-            if os.path.exists(cand):
-                ckpt_path = cand
+        # 3. Load checkpoint
+        ckpt_path = os.path.expanduser(ckpt_path)
+        if not os.path.isabs(ckpt_path):
+            candidates = [
+                ckpt_path,
+                os.path.join(os.path.dirname(os.path.dirname(__file__)), ckpt_path),
+                os.path.join("/root/ULTRA", ckpt_path),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    ckpt_path = c
+                    break
 
-        state = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(state["model"])
+        if os.path.exists(ckpt_path):
+            state = torch.load(ckpt_path, map_location="cpu")
+            if "model" in state:
+                model.load_state_dict(state["model"], strict=False)
+            else:
+                model.load_state_dict(state, strict=False)
 
         return cls(
             model=model,
             graph=graph,
             id2ent=id2ent,
             id2rel=id2rel,
+            ent2text=ent2text,
+            rel2text=rel2text,
             device=device,
             dataset_name=dataset_name,
             easy_answers=easy_answers,
             hard_answers=hard_answers,
         )
 
-    def _resolve_term(self, val: Any, vocab_map: Dict[str, int], term_name: str) -> int:
-        """Resolve a single entity or relation term (int ID or string name) to int ID."""
-        if isinstance(val, int):
-            return val
-        s = str(val).strip()
-        if s in vocab_map:
-            return vocab_map[s]
-        # Check without '+' or '-' prefix for relations
-        if term_name == "relation":
+    def _resolve_term(self, term: Any, vocab: Dict[str, int], name: str) -> int:
+        """Resolve a string or int to a vocabulary index."""
+        if isinstance(term, int):
+            return term
+        if isinstance(term, str):
+            if term in vocab:
+                return vocab[term]
+            norm_term = term.strip()
+            if norm_term in vocab:
+                return vocab[norm_term]
             for prefix in ["+", "-"]:
-                if prefix + s in vocab_map:
-                    return vocab_map[prefix + s]
-                if s.startswith(prefix) and s[1:] in vocab_map:
-                    return vocab_map[s[1:]]
-        # Check if s is numeric string
-        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
-            return int(s)
-        raise ValueError(f"Unknown {term_name} '{val}'. Available examples: {list(vocab_map.keys())[:5]}")
+                alt = prefix + norm_term.lstrip("+-")
+                if alt in vocab:
+                    return vocab[alt]
+        raise KeyError(f"Unknown {name}: '{term}'. Available count: {len(vocab)}")
 
-    def resolve_query(self, nested: Any) -> Tuple:
-        """
-        Recursively resolve entity/relation string names into integer IDs in a BetaE nested tuple.
-        Also translates string operator shortcuts ('n' -> -2, 'u' -> -1).
-        """
-        if not isinstance(nested, tuple):
-            return self._resolve_term(nested, self.ent2id, "entity")
-
-        # Unary operations (projection, negation): (var, (op1, op2, ...))
-        if len(nested) == 2 and isinstance(nested[1], tuple) and len(nested[1]) > 0 and not isinstance(nested[1][-1], tuple):
-            var, unary_ops = nested
-            resolved_var = self.resolve_query(var)
-            resolved_ops = []
-            for op in unary_ops:
-                if op in (-2, "n", "-2", "negation"):
-                    resolved_ops.append(-2)
-                elif op in (-1, "u", "-1", "union"):
-                    resolved_ops.append(-1)
+    def resolve_query(self, nested: Tuple) -> Tuple:
+        """Recursively resolve entity and relation string names to integer IDs."""
+        if len(nested) == 2 and isinstance(nested[1], tuple) and (len(nested[1]) == 0 or not isinstance(nested[1][-1], tuple)):
+            entity, relations = nested
+            entity_id = self._resolve_term(entity, self.ent2id, "entity")
+            resolved_rel = []
+            for r in relations:
+                if r == -1 or r == "n":
+                    resolved_rel.append(-1)
                 else:
-                    resolved_ops.append(self._resolve_term(op, self.rel2id, "relation"))
-            return (resolved_var, tuple(resolved_ops))
+                    resolved_rel.append(self._resolve_term(r, self.rel2id, "relation"))
+            return (entity_id, tuple(resolved_rel))
 
-        # N-ary operations (conjunction/intersection or union)
         resolved_elements = []
         for elem in nested:
-            if elem in (-1, "u", "-1", "union"):
+            if elem == -1 or elem == -2 or elem == "u":
                 resolved_elements.append((-1,))
             elif isinstance(elem, tuple):
                 resolved_elements.append(self.resolve_query(elem))
@@ -280,7 +320,6 @@ class UltraQueryPipeline:
         try:
             q = Query.from_nested(numeric_query)
             readable = q.to_readable()
-            # Replace raw integer IDs with entity and relation names if available
             lines = []
             for line in readable.split("\n"):
                 for ent_id, ent_name in self.id2ent.items():
@@ -313,7 +352,6 @@ class UltraQueryPipeline:
             pd.DataFrame or dict with ranked entities, IDs, probabilities, and logits.
         """
         if isinstance(query, str):
-            # Parse string representation of tuple if passed as string
             import ast
             try:
                 query = ast.literal_eval(query)
@@ -329,7 +367,6 @@ class UltraQueryPipeline:
 
         q_batch = q_tensor.unsqueeze(0).to(self.device)
 
-        # Forward pass (eval mode, symbolic traversal disabled)
         logits = self.model(self.graph, q_batch, symbolic_traversal=False)
         probs = torch.sigmoid(logits[0])
 
@@ -339,7 +376,9 @@ class UltraQueryPipeline:
 
         ranks = list(range(1, k + 1))
         entity_ids = [idx.item() for idx in top_indices]
-        entity_names = [self.id2ent.get(idx, str(idx)) for idx in entity_ids]
+        # Human-readable names if available, fallback to MID / ID
+        entity_names = [self.id2name.get(idx, self.id2ent.get(idx, str(idx))) for idx in entity_ids]
+        entity_mids = [self.id2ent.get(idx, str(idx)) for idx in entity_ids]
         prob_values = [p.item() for p in top_probs]
         logit_values = [l.item() for l in top_logits]
 
@@ -359,6 +398,7 @@ class UltraQueryPipeline:
             "rank": ranks,
             "entity": entity_names,
             "entity_id": entity_ids,
+            "entity_mid": entity_mids,
             "probability": prob_values,
             "logit": logit_values,
         }
@@ -370,6 +410,48 @@ class UltraQueryPipeline:
             df = pd.DataFrame(data)
             return df
         return data
+
+    # ---------------- Natural Language Interface ---------------- #
+
+    def parse_natural(self, question: str) -> Dict[str, Any]:
+        """Parse a natural language question into a BetaE logical query."""
+        return self.nl_parser.parse(question)
+
+    def ask_natural(
+        self,
+        question: str,
+        top_k: int = 10,
+        return_dataframe: bool = True,
+        explain: bool = True,
+    ) -> Union[pd.DataFrame, Dict[str, Any]]:
+        """
+        Answer a naturally phrased question against the knowledge graph.
+
+        Parameters:
+            question: Natural language question (e.g. "What films did Christopher Nolan direct?")
+            top_k: Number of candidate answers to retrieve.
+            return_dataframe: Return a pandas DataFrame if True.
+            explain: If True, prints parsing diagnostics and a natural language answer summary.
+        """
+        parsed = self.parse_natural(question)
+        if explain:
+            print(f"\n" + "-" * 70)
+            print(f" Natural Language Question: \"{parsed['question']}\"")
+            print(f"-" * 70)
+            print(f"  Query Pattern : {parsed['query_type']}")
+            print(f"  Logical AST   : {parsed['logical_query']}")
+            print(f"  Explanation   : {parsed['explanation']}")
+            print(f"-" * 70)
+
+        df = self.ask(parsed["logical_query"], top_k=top_k, return_dataframe=True)
+
+        if explain and isinstance(df, pd.DataFrame) and len(df) > 0:
+            top_answers = [f"{row['entity']} (p={row['probability']:.3f})" for _, row in df.head(3).iterrows()]
+            print(f"  Top Answers   : {', '.join(top_answers)}\n")
+
+        if not return_dataframe:
+            return df.to_dict(orient="records")
+        return df
 
     # ---------------- Shorthand Query Builders ---------------- #
 
@@ -418,7 +500,7 @@ class UltraQueryPipeline:
         top_k: int = 10,
     ) -> pd.DataFrame:
         """Intersection with negation: ?X : r1(e1, ?X) AND NOT r2(e2, ?X)."""
-        return self.ask(((e1, (r1,)), (e2, (r2, -2))), top_k=top_k)
+        return self.ask(((e1, (r1,)), (e2, (r2, -1))), top_k=top_k)
 
     def ask_2u(
         self,
@@ -429,47 +511,30 @@ class UltraQueryPipeline:
         top_k: int = 10,
     ) -> pd.DataFrame:
         """Union query: ?X : r1(e1, ?X) OR r2(e2, ?X)."""
-        return self.ask(((e1, (r1,)), (e2, (r2,)), (-1,)), top_k=top_k)
+        return self.ask(((e1, (r1,)), (e2, (r2,)), -2), top_k=top_k)
 
     # ---------------- Inspection Helpers ---------------- #
 
-    def search_entities(self, pattern: str, limit: int = 10) -> List[Tuple[int, str]]:
+    def search_entities(self, pattern: str, limit: int = 10) -> List[Tuple[int, str, str]]:
         """Search entity vocabulary by substring."""
         pattern = pattern.lower()
         results = []
-        for idx, name in self.id2ent.items():
-            if pattern in name.lower():
-                results.append((idx, name))
+        for idx, mid in self.id2ent.items():
+            name = self.id2name.get(idx, mid)
+            if pattern in name.lower() or pattern in mid.lower():
+                results.append((idx, name, mid))
                 if len(results) >= limit:
                     break
         return results
 
-    def search_relations(self, pattern: str, limit: int = 10) -> List[Tuple[int, str]]:
+    def search_relations(self, pattern: str, limit: int = 10) -> List[Tuple[int, str, str]]:
         """Search relation vocabulary by substring."""
         pattern = pattern.lower()
         results = []
-        for idx, name in self.id2rel.items():
-            if pattern in name.lower():
-                results.append((idx, name))
+        for idx, uri in self.id2rel.items():
+            desc = self.rel2text.get(uri.lstrip("+-"), uri)
+            if pattern in desc.lower() or pattern in uri.lower():
+                results.append((idx, desc, uri))
                 if len(results) >= limit:
                     break
         return results
-
-    def sample_queries(self, query_type: str = "1p", n: int = 5) -> List[Tuple]:
-        """Fetch sample queries of a given structure from the loaded dataset."""
-        type2struct = {
-            "1p": ("e", ("r",)),
-            "2p": ("e", ("r", "r")),
-            "3p": ("e", ("r", "r", "r")),
-            "2i": (("e", ("r",)), ("e", ("r",))),
-            "3i": (("e", ("r",)), ("e", ("r",)), ("e", ("r",))),
-            "2in": (("e", ("r",)), ("e", ("r", "n"))),
-            "3in": (("e", ("r",)), ("e", ("r",)), ("e", ("r", "n"))),
-            "2u": (("e", ("r",)), ("e", ("r",)), ("u",)),
-        }
-        struct = type2struct.get(query_type)
-        if struct is None or not self.easy_answers:
-            return []
-        matching = [q for q in self.easy_answers.keys() if isinstance(q, tuple)]
-        return matching[:n]
-

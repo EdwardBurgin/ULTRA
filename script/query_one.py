@@ -11,7 +11,7 @@ from ultra.pipeline import UltraQueryPipeline
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Execute a single complex logical query with UltraQuery.")
+    parser = argparse.ArgumentParser(description="Execute complex or natural language queries with UltraQuery.")
     parser.add_argument(
         "-d", "--dataset",
         type=str,
@@ -36,6 +36,12 @@ def parse_args():
         type=str,
         default="ckpts/ultraquery.pth",
         help="Path to UltraQuery checkpoint.",
+    )
+    parser.add_argument(
+        "-n", "--natural",
+        type=str,
+        default=None,
+        help="Naturally phrased question, e.g. \"What films did Christopher Nolan direct?\".",
     )
     parser.add_argument(
         "-q", "--query",
@@ -68,7 +74,7 @@ def main():
     args = parse_args()
 
     print(f"\n========================================================")
-    print(f" UltraQuery Single Complex Query Pipeline")
+    print(f" UltraQuery Complex & Natural Language Pipeline")
     print(f"========================================================")
     print(f"Dataset   : {args.dataset} (version={args.version}, split={args.split})")
     print(f"Checkpoint: {args.ckpt}")
@@ -85,34 +91,38 @@ def main():
     print(f"Graph loaded: {pipeline.graph.num_nodes} nodes, {pipeline.graph.num_relations} relations.")
     print(f"Device      : {pipeline.device}")
 
-    # If query not provided via CLI, pick a representative query or prompt user
+    # Mode 1: Natural Language Question
+    if args.natural is not None:
+        df_results = pipeline.ask_natural(args.natural, top_k=args.top_k, explain=True)
+        print("\n" + "=" * 70)
+        print(f" Top {args.top_k} Candidate Answers:")
+        print("=" * 70)
+        print(df_results.to_string(index=False))
+        print("=" * 70 + "\n")
+        return
+
+    # Mode 2: Symbolic Tuple Query
     if args.query is None:
-        print("\nNo query specified via --query (-q). Using demo query:")
-        if "237" in args.dataset:
-            # Major field of study for educational institution /m/01k2wn
-            demo_query = (927, (202,))
-        else:
-            # Fallback to first available entity and relation
-            demo_query = (0, (0,))
-        query_val = demo_query
+        print("\nNo query or natural question specified. Using demo question:")
+        demo_question = "What films did Christopher Nolan direct?"
+        print(f"Demo question: \"{demo_question}\"")
+        df_results = pipeline.ask_natural(demo_question, top_k=args.top_k, explain=True)
     else:
         try:
             query_val = ast.literal_eval(args.query)
         except Exception:
             query_val = args.query
 
-    print(f"\nQuery input: {query_val}")
-    print("\nExecuting inference...")
-    df_results = pipeline.ask(query_val, top_k=args.top_k)
+        print(f"\nQuery input: {query_val}")
+        print("\nExecuting inference...")
+        df_results = pipeline.ask(query_val, top_k=args.top_k)
 
     print("\n" + "=" * 70)
     print(f" Top {args.top_k} Candidate Answers:")
     print("=" * 70)
-    # Print formatted table
     print(df_results.to_string(index=False))
     print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
     main()
-
