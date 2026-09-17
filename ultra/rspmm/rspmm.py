@@ -202,6 +202,14 @@ def load_extension(name, sources, extra_cflags=None, extra_cuda_cflags=None, **k
     return cpp_extension.load(name, sources, extra_cflags, extra_cuda_cflags, **kwargs)
 
 
+# Ensure ninja and CUDA compiler in sys.prefix/bin are discoverable
+bin_dir = os.path.join(sys.prefix, "bin")
+if os.path.exists(os.path.join(bin_dir, "ninja")):
+    if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+if "CUDA_HOME" not in os.environ and os.path.exists(os.path.join(bin_dir, "nvcc")):
+    os.environ["CUDA_HOME"] = sys.prefix
+
 print("Load rspmm extension. This may take a while...")
 path = os.path.join(os.path.dirname(__file__), "source")
 rspmm = load_extension("rspmm", [os.path.join(path, "rspmm.cpp"), os.path.join(path, "rspmm.cu")])

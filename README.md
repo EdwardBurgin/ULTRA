@@ -593,6 +593,79 @@ valid_data = splits["valid_data"]
 test_data  = splits["test_data"]
 ```
 
+## Single Complex Query Answering Pipeline (`UltraQueryPipeline`) ##
+
+In addition to offline dataset benchmarking, ULTRA provides an interactive inference pipeline `UltraQueryPipeline` to answer single first-order logical (FOL) queries on any graph (transductive or inductive). The pipeline evaluates multi-hop projections (`1p`, `2p`, `3p`), conjunctions/intersections (`2i`, `3i`), negations (`2in`), and disjunctions/unions (`2u`), returning ranked candidate entities with confidence scores in a **pandas DataFrame**.
+
+### 1. Python / Jupyter Notebook API
+
+```python
+from ultra.pipeline import UltraQueryPipeline
+
+# Load pre-trained UltraQuery pipeline on FB15k-237 (or an inductive dataset)
+pipeline = UltraQueryPipeline.from_pretrained(
+    dataset="FB15k237LogicalQuery",
+    ckpt_path="ckpts/ultraquery.pth",
+    device="cuda:0",  # or "cpu"
+)
+
+# 1-hop query (1p): What are the major fields of study for institution /m/01k2wn?
+# Supports both human-readable string names and integer IDs
+df_1p = pipeline.ask_1p(
+    entity="/m/01k2wn", 
+    relation="+/education/educational_institution/students_graduates./education/education/major_field_of_study", 
+    top_k=5
+)
+print(df_1p)
+
+# 2-hop intersection (2i): Find entities ?X satisfying r1(e1, ?X) AND r2(e2, ?X)
+df_2i = pipeline.ask_2i(e1=32, r1=97, e2=11188, r2=39, top_k=5)
+
+# Intersection with negation (2in): r1(e1, ?X) AND NOT r2(e2, ?X)
+df_2in = pipeline.ask_2in(e1=32, r1=97, e2=11188, r2=39, top_k=5)
+
+# Arbitrary nested BetaE logical query:
+# ((e1, (r1,)), (e2, (r2,)))
+df_custom = pipeline.ask(((32, (97,)), (11188, (39,))), top_k=10)
+
+# Search entity and relation vocabularies
+print(pipeline.search_entities("harvard"))
+print(pipeline.search_relations("education"))
+```
+
+### 2. Command-Line Interface (`script/query_one.py`)
+
+Run single complex queries directly from the command line:
+
+```bash
+# 1-hop query with Freebase string names:
+python script/query_one.py \
+  -d FB15k237LogicalQuery \
+  -q "('/m/01k2wn', ('+/education/educational_institution/students_graduates./education/education/major_field_of_study',))" \
+  -k 5
+
+# 2-hop intersection (2i) with integer IDs:
+python script/query_one.py \
+  -d FB15k237LogicalQuery \
+  -q "((32, (97,)), (11188, (39,)))" \
+  -k 5
+
+# Inductive query on FB15k237 (550 nodes split):
+python script/query_one.py \
+  -d InductiveFB15k237Query \
+  --version 550 \
+  -k 5
+```
+
+### 3. Run the Demonstration Script
+
+Run a battery of example queries (1p, 2p, 2i, 2in, and string queries):
+
+```bash
+python example_single_query.py
+```
+
+
 ## Citation ##
 
 If you find this codebase useful in your research, please cite the original papers.
