@@ -65,8 +65,8 @@ class UltraQueryPipeline:
         # Human-readable entity names
         self.id2name = {eid: self.ent2text.get(mid, mid) for eid, mid in self.id2ent.items()}
 
-        # Natural Language Parser
-        self.nl_parser = NLQueryParser(self.id2ent, self.id2rel, self.ent2text, self.rel2text)
+        # Natural Language Parser (multilingual-e5 + jieba)
+        self.nl_parser = NLQueryParser(self.id2ent, self.id2rel, self.ent2text, self.rel2text, device=self.device)
 
         self.dataset_name = dataset_name or "CustomGraph"
         self.easy_answers = easy_answers or {}

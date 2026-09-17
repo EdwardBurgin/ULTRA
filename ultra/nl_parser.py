@@ -1,10 +1,15 @@
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import jieba
+import torch
 
-# Common question words, relational verbs/nouns, and schema indicators that should not
-# be casually linked as subject entities unless explicitly quoted.
+from ultra.relation_matcher import MultilingualRelationMatcher
+
+
+# Schema stopwords to ignore during entity linking in English and Chinese
 SCHEMA_STOP_WORDS = {
+    # English
     "star", "stars", "starring", "starred", "major", "majors", "majored", "director",
     "directors", "directed", "actor", "actors", "actress", "actresses", "film", "films",
     "movie", "movies", "study", "studies", "education", "field", "fields", "degree",
@@ -14,20 +19,69 @@ SCHEMA_STOP_WORDS = {
     "place", "places", "what", "which", "where", "who", "when", "how", "whose", "whom",
     "both", "either", "neither", "also", "well", "name", "names", "kind", "kinds", "type",
     "types", "one", "ones", "associated", "located", "contained", "people", "person",
+    
+    # Chinese
+    "电影", "影片", "作品", "哪部", "哪些", "哪个", "谁", "什么", "哪里", "何处",
+    "导演", "执导", "主演", "出演", "扮演", "参演", "出生", "出生地", "出生于",
+    "国籍", "专业", "就读", "毕业", "学院", "大学", "学生", "学者", "奖项", "获得",
+    "并且", "而且", "且", "和", "与", "同", "或者", "或", "还是", "不是", "并非",
+    "未曾", "未由", "不曾", "没有", "排除", "不包括", "的", "了", "在", "是", "由"
 }
+
+# Regex to detect negation connectives across Chinese and English
+NEG_CONNECTIVES_REGEX = (
+    r"(?:"
+    r"\b(?:and|but)\s+(?:were\s+|are\s+|is\s+|was\s+|did\s+)?not\b"
+    r"|\bwithout\b|\bexcluding\b"
+    r"|且并非由|且并非|并且不是由|并且不是|而不是由|而不是|并非由|并非|不是由|不是|未由|未曾|不曾|排除|不包括"
+    r")"
+)
+
+# Regex to detect conjunction / intersection connectives
+CONJ_CONNECTIVES_REGEX = (
+    r"(?:"
+    r"\b(?:and|both|as well as)\b"
+    r"|并且|而且|同时|且|和|与"
+    r")"
+)
+
+# Regex to detect disjunction / union connectives
+DISJ_CONNECTIVES_REGEX = (
+    r"(?:"
+    r"\b(?:or|either)\b"
+    r"|或者|或|还是"
+    r")"
+)
+
+# Canonical intent lexicon for instant high-precision relation resolution
+INTENT_LEXICON = [
+    # Actor / starring
+    (r"(?:主演|出演|参演|扮演|演员|starring|starred|star\b|stars\b|actor|actress)", "+/film/actor/film./film/performance/film"),
+    # Director / directed
+    (r"(?:导演|执导|directed|director|direct\b)", "+/film/director/film"),
+    # Place of birth
+    (r"(?:出生地|出生在|出生于|出生|born|birthplace|place of birth)", "+/people/person/place_of_birth"),
+    # Nationality
+    (r"(?:国籍|哪国人|nationality|citizenship|citizen)", "+/people/person/nationality"),
+    # Field of study / Major
+    (r"(?:专业|主修|研究领域|major|field of study|studied)", "+/education/educational_institution/students_graduates./education/education/major_field_of_study"),
+    # Genre
+    (r"(?:流派|风格|题材|类型|genre)", "+/film/film/genre"),
+]
 
 
 class NLQueryParser:
     """
-    Translates naturally phrased questions into formal First-Order Logical (FOL)
-    query structures (BetaE nested tuples) for UltraQuery execution.
+    Generic Multilingual Query Parser for Knowledge Graph Reasoning.
     
-    Supports:
-      - 1p: 1-hop path queries: (e, (r,))
-      - 2p: 2-hop path queries: (e, (r1, r2))
-      - 2i: 2-hop conjunctions / intersections: ((e1, (r1,)), (e2, (r2,)))
-      - 2in: 2-hop intersections with negation: ((e1, (r1,)), (e2, (r2, -1)))
-      - 2u: 2-hop disjunctions / unions: ((e1, (r1,)), (e2, (r2,)), -2)
+    Translates natural language questions in Chinese, English, and other languages
+    into formal BetaE First-Order Logical (FOL) query structures.
+    
+    Key Features:
+      - Generic Entity Extraction: Matches graph entities directly with CJK-safe boundary matching.
+      - Cross-Lingual Semantic Matching: Hybrid resolution combining canonical multilingual intent
+        lexicon with dense intfloat/multilingual-e5-small embeddings for zero-shot generalization.
+      - Multilingual Connective Lexicon: Accurately classifies and splits 2in, 2i, 2u, 2p, and 1p queries.
     """
 
     def __init__(
@@ -36,6 +90,7 @@ class NLQueryParser:
         id2rel: Dict[int, str],
         ent2text: Optional[Dict[str, str]] = None,
         rel2text: Optional[Dict[str, str]] = None,
+        device: Optional[Union[str, torch.device]] = None,
     ):
         self.id2ent = id2ent
         self.id2rel = id2rel
@@ -44,108 +99,41 @@ class NLQueryParser:
         
         self.ent2text = ent2text or {}
         self.rel2text = rel2text or {}
+        self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        # Build name -> entity_id lookup
+        # Dense cross-lingual relation matcher (multilingual-e5)
+        self.relation_matcher = MultilingualRelationMatcher(
+            id2rel=self.id2rel,
+            rel2text=self.rel2text,
+            device=self.device,
+        )
+
+        # Build generic entity lookup dictionary from whatever entities exist in the graph
         self.name2id: Dict[str, int] = {}
         for mid, name in self.ent2text.items():
-            if mid in self.ent2id:
-                eid = self.ent2id[mid]
+            clean_mid = mid.replace("_zh", "")
+            if clean_mid in self.ent2id:
+                eid = self.ent2id[clean_mid]
                 self.name2id[name.lower().strip()] = eid
 
-        # Add raw MIDs
+        # Add raw MIDs / node IDs
         for mid, eid in self.ent2id.items():
             self.name2id[mid.lower().strip()] = eid
 
-        # Add common aliases for high-frequency entities
-        aliases = {
-            "uc berkeley": "university of california, berkeley",
-            "berkeley": "university of california, berkeley",
-            "cal": "university of california, berkeley",
-            "harvard": "harvard university",
-            "mit": "massachusetts institute of technology",
-            "ucl": "university college london",
-            "nyu": "new york university",
-            "nolan": "christopher nolan",
-            "chris nolan": "christopher nolan",
-            "bale": "christian bale",
-            "obama": "barack obama",
-            "barack": "barack obama",
-            "steve jobs": "steve jobs",
-            "alan turing": "alan turing",
-            "the dark knight": "the dark knight",
-            "dark knight": "the dark knight",
-            "the dark knight rises": "the dark knight rises",
-            "dark knight rises": "the dark knight rises",
-            "inception": "inception",
-            "memento": "memento",
-            "the prestige": "the prestige",
-            "prestige": "the prestige",
-            "batman begins": "batman begins",
-            "america": "united states of america",
-            "usa": "united states of america",
-            "us": "united states of america",
-            "uk": "united kingdom",
-            "britain": "united kingdom",
-            "england": "england",
-            "london": "london",
-            "chicago cubs": "chicago cubs",
-        }
-        for alias, target_name in aliases.items():
-            if target_name in self.name2id and alias not in self.name2id:
-                self.name2id[alias] = self.name2id[target_name]
-
-        # Sort candidate names by length descending
+        # Sort candidate entity names by length descending for greedy matching
         self._sorted_names = sorted(self.name2id.keys(), key=lambda x: len(x), reverse=True)
-
-        # High-precision relation patterns for FB15k-237
-        self._relation_patterns: List[Tuple[str, str]] = [
-            # Films / Media
-            (r"\b(direct|directed|director|filmmaker|directed by)\b", "+/film/director/film"),
-            (r"\b(act in|acted in|actor|actress|star|stars|starred|starring|performance|played in|featuring)\b", "+/film/actor/film./film/performance/film"),
-            (r"\b(produced|produced by|producer)\b", "+/film/film/produced_by"),
-            (r"\b(written by|screenplay|screenwriter|wrote)\b", "+/film/film/written_by"),
-            (r"\b(film genre|movie genre|film.*genre)\b", "+/film/film/genre"),
-            
-            # People / Biography
-            (r"\b(born in|born at|birthplace|place of birth|where was .* born)\b", "+/people/person/place_of_birth"),
-            (r"\b(nationality|citizenship|citizen of|from which country)\b", "+/people/person/nationality"),
-            (r"\b(gender|sex)\b", "+/people/person/gender"),
-            (r"\b(profession|job|occupation|career)\b", "+/people/person/profession"),
-            (r"\b(spouse|married to|wife|husband)\b", "+/people/person/spouse_s./people/marriage/spouse"),
-            (r"\b(child|children|son|daughter)\b", "+/people/person/children"),
-            (r"\b(parents|father|mother)\b", "+/people/person/parents"),
-            (r"\b(influenced by|influences)\b", "+/influence/influence_node/influenced_by"),
-            
-            # Education
-            (r"\b(major|field of study|fields of study|majored in|degree in|study|studies)\b", "+/education/educational_institution/students_graduates./education/education/major_field_of_study"),
-            (r"\b(student|students|graduate|graduates|alumni|attended|graduated from|alma mater)\b", "+/education/educational_institution/students_graduates./education/education/student"),
-            (r"\b(school type|type of school|institution type)\b", "+/education/educational_institution/school_type"),
-            (r"\b(campuses|campus)\b", "+/education/educational_institution/campuses"),
-
-            # Geography & Locations
-            (r"\b(capital|capital of|capital city)\b", "+/location/country/capital"),
-            (r"\b(language|languages|languages spoken|official language)\b", "+/location/country/languages_spoken"),
-            (r"\b(located in|contained in|where is|in which city|in which country)\b", "+/location/location/contains"),
-
-            # Awards & Honors
-            (r"\b(award|awards|won|received|honor|awarded|nominated for)\b", "+/award/award_nominee/award_nominations./award/award_nomination/award"),
-
-            # Music
-            (r"\b(music genre|musical style|genre of music)\b", "+/music/artist/genre"),
-            (r"\b(instrument|instruments played|role in track)\b", "+/music/artist/track_contributions./music/track_contribution/role"),
-        ]
 
     def find_entities(self, text: str) -> List[Tuple[int, str, int, int]]:
         """
-        Extracts entity mentions from natural text.
-        Returns a list of (entity_id, matched_text, start_char, end_char).
+        Extracts entity mentions from natural text (English, Chinese, etc.).
+        Returns list of (entity_id, matched_text, start_idx, end_idx).
         """
         text_lower = text.lower()
         matches = []
         occupied_spans = []
 
-        # 1. Check quoted text first: "Christopher Nolan"
-        quoted = re.finditer(r'["\']([^"\']+)["\']', text)
+        # 1. Check quotes first: "...", '...', 《...》 (Chinese book/film quotes)
+        quoted = re.finditer(r'["\'《]([^"\'》]+)["\'》]', text)
         for m in quoted:
             phrase = m.group(1).lower().strip()
             if phrase in self.name2id:
@@ -153,207 +141,232 @@ class NLQueryParser:
                 matches.append((eid, m.group(1), m.start(1), m.end(1)))
                 occupied_spans.append((m.start(1), m.end(1)))
 
-        # 2. Greedy longest string matching
+        # 2. Greedy longest matching over the graph's entity catalog with CJK-safe boundaries
         for candidate in self._sorted_names:
-            # Skip schema stopwords unless quoted
-            if candidate in SCHEMA_STOP_WORDS:
+            if candidate in SCHEMA_STOP_WORDS or len(candidate) < 2:
                 continue
-            if len(candidate) < 3:
-                continue
-            
-            pattern = r'\b' + re.escape(candidate) + r'\b'
+
+            # For Latin / English text, use ASCII boundary assertions; for CJK text, match direct substrings
+            is_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in candidate)
+            if is_cjk:
+                pattern = re.escape(candidate)
+            else:
+                pattern = r'(?<![a-zA-Z0-9])' + re.escape(candidate) + r'(?![a-zA-Z0-9])'
+
             for m in re.finditer(pattern, text_lower):
                 s, e = m.start(), m.end()
-                # Check overlap with already claimed longer spans
                 if any(not (e <= os_ or s >= oe_) for os_, oe_ in occupied_spans):
                     continue
-                
+
                 eid = self.name2id[candidate]
                 orig_text = text[s:e]
                 matches.append((eid, orig_text, s, e))
                 occupied_spans.append((s, e))
 
-        # Sort by start position
+        # 3. Chinese word segmentation with jieba as an entity discovery fallback
+        has_chinese = any('\u4e00' <= ch <= '\u9fff' for ch in text)
+        if has_chinese and not matches:
+            tokens = list(jieba.cut(text))
+            for tok in tokens:
+                tok_clean = tok.lower().strip()
+                if tok_clean in self.name2id and tok_clean not in SCHEMA_STOP_WORDS:
+                    eid = self.name2id[tok_clean]
+                    matches.append((eid, tok, 0, len(tok)))
+
         matches.sort(key=lambda x: x[2])
         return matches
 
-    def find_relation(self, text: str) -> Optional[Tuple[int, str]]:
+    def find_relation(self, text: str, min_score: float = 0.55) -> Optional[Tuple[int, str]]:
         """
-        Matches relational phrases in text to a knowledge graph relation.
-        Returns (relation_id, relation_uri) or None.
+        Extracts relation intent using hybrid resolution:
+        1. Fast, exact matching via multilingual intent lexicon.
+        2. Dense multilingual-e5 embeddings for unseen / generalized relation phrases.
         """
-        text_lower = text.lower()
-        for pat, rel_uri in self._relation_patterns:
-            if re.search(pat, text_lower):
-                if rel_uri in self.rel2id:
-                    return (self.rel2id[rel_uri], rel_uri)
-                for prefix in ["+", "-"]:
-                    alt = prefix + rel_uri.lstrip("+-")
-                    if alt in self.rel2id:
-                        return (self.rel2id[alt], alt)
+        text_clean = text.lower()
+        
+        # 1. Check canonical intent lexicon
+        for pattern, uri in INTENT_LEXICON:
+            if re.search(pattern, text_clean):
+                if uri in self.rel2id:
+                    return (self.rel2id[uri], uri)
 
-        # Fallback: token overlap against rel2text
-        tokens = set(re.findall(r"\w+", text_lower)) - SCHEMA_STOP_WORDS
-        best_r = None
-        best_score = 0.0
-
-        for r_uri, desc in self.rel2text.items():
-            desc_tokens = set(re.findall(r"\w+", desc.lower()))
-            overlap = len(tokens & desc_tokens)
-            if overlap > best_score and overlap >= 2:
-                best_score = overlap
-                best_r = r_uri
-
-        if best_r and best_r in self.rel2id:
-            return (self.rel2id[best_r], best_r)
-        elif best_r:
-            for prefix in ["+", "-"]:
-                alt = prefix + best_r.lstrip("+-")
-                if alt in self.rel2id:
-                    return (self.rel2id[alt], alt)
+        # 2. Dense multilingual-e5 fallback
+        clean_text = re.sub(r"[？?！!，,。.\-_/\\\"'《》]", " ", text).strip()
+        results = self.relation_matcher.match(clean_text, top_k=1)
+        if results:
+            rid, uri, score = results[0]
+            if score >= min_score:
+                return (rid, uri)
 
         return None
 
     def parse(self, question: str) -> Dict[str, Any]:
         """
-        Parses a natural language question into a BetaE logical query structure.
+        Parses a natural language question (Chinese, English, etc.) into a BetaE logical query.
         """
         q = question.strip()
         q_lower = q.lower()
 
         # -------------------------------------------------------------
         # 1. Detect Negation Conjunction (2in)
-        # e.g., "movies star Christian Bale and were not directed by Christopher Nolan"
+        # e.g., "哪些电影由克里斯蒂安·贝尔主演且并非由克里斯托弗·诺兰导演？"
+        # e.g., "Which movies star Christian Bale and were not directed by Christopher Nolan?"
         # -------------------------------------------------------------
-        neg_regex = r"\b(?:and|but)\s+(?:were\s+|are\s+|is\s+|was\s+|did\s+)?not\b|\bwithout\b|\bexcluding\b"
-        neg_split = re.split(neg_regex, q_lower, maxsplit=1)
+        neg_split = re.split(NEG_CONNECTIVES_REGEX, q_lower, maxsplit=1)
         if len(neg_split) == 2:
             part1, part2 = neg_split
             ents1 = self.find_entities(part1)
             ents2 = self.find_entities(part2)
-            rel1 = self.find_relation(part1)
-            rel2 = self.find_relation(part2)
 
-            if ents1 and ents2 and rel1 and rel2:
-                # Pick longest entity if multiple
+            if ents1 and ents2:
                 e1, e1_name = max(ents1, key=lambda x: len(x[1]))[:2]
                 e2, e2_name = max(ents2, key=lambda x: len(x[1]))[:2]
-                r1, r1_uri = rel1
-                r2, r2_uri = rel2
-                query_tuple = ((e1, (r1,)), (e2, (r2, -2)))
-                return {
-                    "question": question,
-                    "query_type": "2in",
-                    "logical_query": query_tuple,
-                    "entities": [(e1, e1_name), (e2, e2_name)],
-                    "relations": [(r1, r1_uri), (r2, r2_uri)],
-                    "explanation": f"Intersection with Negation: ?X satisfies {r1_uri}({e1_name}, ?X) AND NOT {r2_uri}({e2_name}, ?X)"
-                }
+                
+                # Strip entity mentions before relation extraction to eliminate semantic bias
+                p1_rel_text = part1.replace(e1_name.lower(), " ")
+                p2_rel_text = part2.replace(e2_name.lower(), " ")
+                
+                rel1 = self.find_relation(p1_rel_text)
+                rel2 = self.find_relation(p2_rel_text)
+
+                if rel1 and rel2:
+                    r1, r1_uri = rel1
+                    r2, r2_uri = rel2
+                    # BetaE 2in: ((e1, (r1,)), (e2, (r2, -2)))
+                    query_tuple = ((e1, (r1,)), (e2, (r2, -2)))
+                    return {
+                        "question": question,
+                        "query_type": "2in",
+                        "logical_query": query_tuple,
+                        "entities": [(e1, e1_name), (e2, e2_name)],
+                        "relations": [(r1, r1_uri), (r2, r2_uri)],
+                        "explanation": f"Intersection with Negation: ?X satisfies {r1_uri}({e1_name}, ?X) AND NOT {r2_uri}({e2_name}, ?X)"
+                    }
 
         # -------------------------------------------------------------
         # 2. Detect Conjunction / Intersection (2i)
-        # e.g., "movies star Christian Bale and were directed by Christopher Nolan"
+        # e.g., "哪些电影由克里斯蒂安·贝尔主演并且由克里斯托弗·诺兰导演？"
+        # e.g., "Which movies star Christian Bale and were directed by Christopher Nolan?"
         # -------------------------------------------------------------
-        conj_split = re.split(r"\b(?:and|both)\b", q_lower)
+        conj_split = re.split(CONJ_CONNECTIVES_REGEX, q_lower)
         if len(conj_split) >= 2:
             part1 = conj_split[0]
             part2 = " ".join(conj_split[1:])
             ents1 = self.find_entities(part1)
             ents2 = self.find_entities(part2)
-            rel1 = self.find_relation(part1)
-            rel2 = self.find_relation(part2)
 
-            if ents1 and ents2 and rel1 and rel2:
+            if ents1 and ents2:
                 e1, e1_name = max(ents1, key=lambda x: len(x[1]))[:2]
                 e2, e2_name = max(ents2, key=lambda x: len(x[1]))[:2]
-                r1, r1_uri = rel1
-                r2, r2_uri = rel2
-                query_tuple = ((e1, (r1,)), (e2, (r2,)))
-                return {
-                    "question": question,
-                    "query_type": "2i",
-                    "logical_query": query_tuple,
-                    "entities": [(e1, e1_name), (e2, e2_name)],
-                    "relations": [(r1, r1_uri), (r2, r2_uri)],
-                    "explanation": f"Conjunction: ?X satisfies {r1_uri}({e1_name}, ?X) AND {r2_uri}({e2_name}, ?X)"
-                }
+                
+                p1_rel_text = part1.replace(e1_name.lower(), " ")
+                p2_rel_text = part2.replace(e2_name.lower(), " ")
+
+                rel1 = self.find_relation(p1_rel_text)
+                rel2 = self.find_relation(p2_rel_text)
+
+                if rel1 and rel2:
+                    r1, r1_uri = rel1
+                    r2, r2_uri = rel2
+                    # BetaE 2i: ((e1, (r1,)), (e2, (r2,)))
+                    query_tuple = ((e1, (r1,)), (e2, (r2,)))
+                    return {
+                        "question": question,
+                        "query_type": "2i",
+                        "logical_query": query_tuple,
+                        "entities": [(e1, e1_name), (e2, e2_name)],
+                        "relations": [(r1, r1_uri), (r2, r2_uri)],
+                        "explanation": f"Conjunction: ?X satisfies {r1_uri}({e1_name}, ?X) AND {r2_uri}({e2_name}, ?X)"
+                    }
 
         # -------------------------------------------------------------
         # 3. Detect Disjunction / Union (2u)
-        # e.g., "movies star Christian Bale or were directed by Christopher Nolan"
+        # e.g., "哪些电影由克里斯蒂安·贝尔主演或者由克里斯托弗·诺兰导演？"
+        # e.g., "Which movies star Christian Bale or were directed by Christopher Nolan?"
         # -------------------------------------------------------------
-        disj_split = re.split(r"\b(?:or|either)\b", q_lower)
+        disj_split = re.split(DISJ_CONNECTIVES_REGEX, q_lower)
         if len(disj_split) >= 2:
             part1 = disj_split[0]
             part2 = " ".join(disj_split[1:])
             ents1 = self.find_entities(part1)
             ents2 = self.find_entities(part2)
-            rel1 = self.find_relation(part1)
-            rel2 = self.find_relation(part2)
 
-            if ents1 and ents2 and rel1 and rel2:
+            if ents1 and ents2:
                 e1, e1_name = max(ents1, key=lambda x: len(x[1]))[:2]
                 e2, e2_name = max(ents2, key=lambda x: len(x[1]))[:2]
-                r1, r1_uri = rel1
-                r2, r2_uri = rel2
-                # BetaE 2u: ((e1, (r1,)), (e2, (r2,)), (-1,))
-                query_tuple = ((e1, (r1,)), (e2, (r2,)), (-1,))
-                return {
-                    "question": question,
-                    "query_type": "2u",
-                    "logical_query": query_tuple,
-                    "entities": [(e1, e1_name), (e2, e2_name)],
-                    "relations": [(r1, r1_uri), (r2, r2_uri)],
-                    "explanation": f"Disjunction: ?X satisfies {r1_uri}({e1_name}, ?X) OR {r2_uri}({e2_name}, ?X)"
-                }
+                
+                p1_rel_text = part1.replace(e1_name.lower(), " ")
+                p2_rel_text = part2.replace(e2_name.lower(), " ")
+
+                rel1 = self.find_relation(p1_rel_text)
+                rel2 = self.find_relation(p2_rel_text)
+
+                if rel1 and rel2:
+                    r1, r1_uri = rel1
+                    r2, r2_uri = rel2
+                    # BetaE 2u: ((e1, (r1,)), (e2, (r2,)), (-1,))
+                    query_tuple = ((e1, (r1,)), (e2, (r2,)), (-1,))
+                    return {
+                        "question": question,
+                        "query_type": "2u",
+                        "logical_query": query_tuple,
+                        "entities": [(e1, e1_name), (e2, e2_name)],
+                        "relations": [(r1, r1_uri), (r2, r2_uri)],
+                        "explanation": f"Disjunction: ?X satisfies {r1_uri}({e1_name}, ?X) OR {r2_uri}({e2_name}, ?X)"
+                    }
 
         # -------------------------------------------------------------
         # 4. Detect 2-hop Path (2p)
+        # e.g., "盗梦空间的导演出生在哪里？"
         # e.g., "Where was the director of Inception born?"
         # -------------------------------------------------------------
         ents = self.find_entities(q)
         if ents:
-            # Pick longest entity
             e, e_name, e_start, e_end = max(ents, key=lambda x: len(x[1]))
 
-            if re.search(r"\bdirector of\b", q_lower) and re.search(r"\b(born|birthplace)\b", q_lower):
-                r1 = self.rel2id.get("-/film/director/film", 205)
-                r2 = self.rel2id.get("+/people/person/place_of_birth", 48)
-                query_tuple = (e, (r1, r2))
-                return {
-                    "question": question,
-                    "query_type": "2p",
-                    "logical_query": query_tuple,
-                    "entities": [(e, e_name)],
-                    "relations": [(r1, "-/film/director/film"), (r2, "+/people/person/place_of_birth")],
-                    "explanation": f"2-hop Path: ?X is birthplace of director of {e_name}"
-                }
-
-            if re.search(r"\bdirector of\b", q_lower) and re.search(r"\b(nationality|citizen)\b", q_lower):
-                r1 = self.rel2id.get("-/film/director/film", 205)
-                r2 = self.rel2id.get("+/people/person/nationality", 96)
-                query_tuple = (e, (r1, r2))
-                return {
-                    "question": question,
-                    "query_type": "2p",
-                    "logical_query": query_tuple,
-                    "entities": [(e, e_name)],
-                    "relations": [(r1, "-/film/director/film"), (r2, "+/people/person/nationality")],
-                    "explanation": f"2-hop Path: ?X is nationality of director of {e_name}"
-                }
+            is_2p = (
+                re.search(r"\bdirector of\b", q_lower) or
+                re.search(r"导演出生|导演的出生|导演.*在哪|导演.*国籍", q_lower)
+            )
+            if is_2p:
+                if re.search(r"(?:born|birthplace|出生|出生地|出生在哪)", q_lower):
+                    # r1: reverse director (-/film/director/film, id 205)
+                    # r2: place of birth (+/people/person/place_of_birth, id 48)
+                    r1 = self.rel2id.get("-/film/director/film", 205)
+                    r2 = self.rel2id.get("+/people/person/place_of_birth", 48)
+                    return {
+                        "question": question,
+                        "query_type": "2p",
+                        "logical_query": (e, (r1, r2)),
+                        "entities": [(e, e_name)],
+                        "relations": [(r1, "-/film/director/film"), (r2, "+/people/person/place_of_birth")],
+                        "explanation": f"2-hop Path: ?X is birthplace of director of {e_name}"
+                    }
+                elif re.search(r"(?:nationality|citizen|国籍)", q_lower):
+                    r1 = self.rel2id.get("-/film/director/film", 205)
+                    r2 = self.rel2id.get("+/people/person/nationality", 96)
+                    return {
+                        "question": question,
+                        "query_type": "2p",
+                        "logical_query": (e, (r1, r2)),
+                        "entities": [(e, e_name)],
+                        "relations": [(r1, "-/film/director/film"), (r2, "+/people/person/nationality")],
+                        "explanation": f"2-hop Path: ?X is nationality of director of {e_name}"
+                    }
 
             # -------------------------------------------------------------
             # 5. Default: 1-hop Projection (1p)
-            # e.g., "What films did Christopher Nolan direct?"
+            # e.g., "克里斯托弗·诺兰导演了哪些电影？"
+            # e.g., "Where was Christopher Nolan born?"
             # -------------------------------------------------------------
-            rel = self.find_relation(q)
+            clean_q = q.replace(e_name, " ")
+            rel = self.find_relation(clean_q)
             if rel:
                 r, r_uri = rel
-                query_tuple = (e, (r,))
                 return {
                     "question": question,
                     "query_type": "1p",
-                    "logical_query": query_tuple,
+                    "logical_query": (e, (r,)),
                     "entities": [(e, e_name)],
                     "relations": [(r, r_uri)],
                     "explanation": f"1-hop Path: ?X satisfies {r_uri}({e_name}, ?X)"
