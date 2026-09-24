@@ -66,8 +66,19 @@ Ultra PyG is implemented with Python 3.9, PyTorch 2.1 and PyG 2.4 (CUDA 11.8 or 
 ### From Conda ###
 
 ```bash
+conda create -n pyg_env python=3.10 \
+  pytorch=2.1.0 pytorch-cuda=11.8 cudatoolkit=11.8 \
+  pytorch-scatter=2.1.2 pyg=2.4.0 \
+  ninja easydict pyyaml \
+  "numpy<2" "setuptools<70" \
+  -c pytorch -c nvidia -c pyg -c conda-forge -y
+
+conda activate pyg_env
 conda install pytorch=2.1.0 pytorch-cuda=11.8 cudatoolkit=11.8 pytorch-scatter=2.1.2 pyg=2.4.0 -c pytorch -c nvidia -c pyg -c conda-forge
 conda install ninja easydict pyyaml -c conda-forge
+conda install -c anaconda -c conda-forge pandas jieba openpyxl nb_conda_kernels ipywidgets ipykernel -y
+
+python -m ipykernel install --user --name pyg_env
 ```
 
 ### From Pip ###
