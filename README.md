@@ -77,6 +77,7 @@ conda activate pyg_env
 conda install pytorch=2.1.0 pytorch-cuda=11.8 cudatoolkit=11.8 pytorch-scatter=2.1.2 pyg=2.4.0 -c pytorch -c nvidia -c pyg -c conda-forge
 conda install ninja easydict pyyaml -c conda-forge
 conda install -c anaconda -c conda-forge pandas jieba openpyxl nb_conda_kernels ipywidgets ipykernel -y
+conda install -c "nvidia/label/cuda-11.8.0" cuda-libraries-dev -y
 
 python -m ipykernel install --user --name pyg_env
 ```
